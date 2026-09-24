@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:redis="http://www.mulesoft.org/schema/mule/redis" xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:os="http://www.mulesoft.org/schema/mule/os"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/os http://www.mulesoft.org/schema/mule/os/current/mule-os.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/redis http://www.mulesoft.org/schema/mule/redis/current/mule-redis.xsd">
+	<salesforce:sfdc-config name="Salesforce_Config" doc:name="Salesforce Config" doc:id="2c270194-fd90-4162-ba99-eefc07ba5b65" >
+		<salesforce:oauth-client-credentials-connection >
+			<salesforce:oauth-client-credentials clientId="${salesforce.clientId}" clientSecret="${salesforce.clientSecret}" tokenUrl="${salesforce.tokenUrl}" />
+		</salesforce:oauth-client-credentials-connection>
+	</salesforce:sfdc-config>
+	<http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="c71bd97c-7d76-44ba-b08e-eef16f49e63b" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+	<redis:redis-config name="Redis_Redis" doc:name="Redis Redis" doc:id="56438b3e-cab1-416f-8b2c-e0db03f2347a" >
+		<redis:nonclustered-connection host="${redis.host}" port="${redis.port}" username="${redis.username}" password="${redis.password}"/>
+	</redis:redis-config>
+	<flow name="sfcdcFlow" doc:id="240f0518-08ec-4d2c-8448-ff6f9a2faff4" >
+		<salesforce:replay-channel-listener streamingChannel="/data/ChangeEvents" replayOption="FROM_REPLAY_ID" doc:name="Replay channel listener" doc:id="0dc2650f-1ebd-44d7-96c6-68946382f9d9" config-ref="Salesforce_Config" replayId="1583954"/>
+		<os:store doc:name="Store" doc:id="1a6afcdc-643b-4a29-9cf0-941b2acdd9ba" key="latestEvent" />
+		<logger level="INFO" doc:name="Logger" doc:id="5e0a2b5e-8d93-4474-abb3-a9681dc74dda" message="Salesforce CDC Event Received:&#10;#[payload]"/>
+	</flow>
+	<flow name="sfcdcFlow1" doc:id="ba4a7b65-cc55-409f-8814-cf64881ce1ab" >
+		<http:listener doc:name="Listener" doc:id="7aaf6f08-409f-4119-b871-0ad21f46dd5e" config-ref="HTTP_Listener_config" path="/data/ChangeEvents" />
+		<logger level="INFO" doc:name="Logger" doc:id="e7d7f758-af8d-451f-bd9d-cf7ffd237505" message='#[payload]'/>
+		<os:retrieve doc:name="Retrieve" doc:id="ef9d19d4-ce6a-4d8b-8f7b-c0952c4d3049" key="latestEvent" />
+		<logger level="INFO" doc:name="Logger" doc:id="1b6e8aeb-92c6-401b-94de-039a7d146a58" message="ORIGINAL CDC PAYLOAD = #[payload]"/>
+		<ee:transform doc:name="Transform Message" doc:id="b7f2fa9e-e1bc-4ced-94dc-c2fcbb90f041">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+import * from dw::core::Strings
+
+fun flatten(obj, prefix = "") =
+    (keysOf(obj)) flatMap ((key) ->
+        do {
+            var value = obj[key]
+            var fieldName = if (prefix == "") key as String else prefix ++ "." ++ (key as String)
+            ---
+            if (value is Object and not (value is Null))
+                flatten(value, fieldName)
+            else
+                [{ field: fieldName, newValue: value }]
+        }
+    )
+
+---
+do {
+    var eventData = payload.data default {}
+    var body = eventData.payload default {}
+    var header = body.ChangeEventHeader default {}
+
+    var changeType = header.changeType default ""
+    var replayId = eventData.event.replayId default "unknown"
+
+    var metaFieldsToSkip = ["ChangeEventHeader"]
+
+    var createChanges =
+        (keysOf(body) filter (not (metaFieldsToSkip contains ($ as String))))
+        flatMap ((key) -> flatten({ (key): body[key] }))
+
+    var updateChanges =
+        (header.changedFields default []) map ((field) -> {
+            field: field,
+
+            newValue:
+                if (field contains ".")
+                    do {
+                        var parts = field splitBy "."
+                        ---
+                        parts reduce ((part, acc = body) ->
+                            if (acc == null)
+                                null
+                            else
+                                acc[part]
+                        )
+                    }
+                else
+                    body[field] default null
+        })
+
+    var finalChanges =
+        if (changeType == "CREATE")
+            createChanges
+        else
+            updateChanges
+
+    ---
+    {
+        // Mule-generated processing UUID.
+        // This is NOT the Salesforce CDC EventUuid.
+        processingUuid: uuid(),
+
+        // Current deduplication identity.
+        eventKey:
+            (header.entityName default "unknown")
+            ++ "."
+            ++ (header.recordIds[0] default "unknown")
+            ++ "-"
+            ++ (replayId as String),
+
+        // Salesforce CDC information
+        entityName: header.entityName default "unknown",
+        recordId: header.recordIds[0] default null,
+        changeType: changeType,
+        replayId: replayId,
+
+        // Salesforce CDC transaction metadata
+        transactionKey: header.transactionKey default null,
+        commitNumber: header.commitNumber default null,
+        sequenceNumber: header.sequenceNumber default null,
+        commitUser: header.commitUser default null,
+        commitTimestamp: header.commitTimestamp default null,
+
+        // Record timestamp
+        eventTimestamp: body.LastModifiedDate default null,
+
+        // Changed fields
+        changedFields: finalChanges map $.field,
+        changes: finalChanges
+    }
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<set-variable value='#[(payload.entityName as String)&#10;    ++ "."&#10;    ++ (payload.recordId as String)&#10;    ++ "-"&#10;    ++ (payload.replayId as String)]' doc:name="Set Variable" doc:id="f9534140-e038-4b89-992c-09a631bb808d" variableName="eventKey"/>
+		<set-variable doc:name="Set Variable" doc:id="e72fd729-e12f-4e9e-905f-4943d762e0bd" variableName="dedupKey" value='#["cdc.dedup."&#10;    ++ vars.eventKey]'/>
+		<redis:get doc:name="Get" doc:id="0b9cffa4-42dc-4b11-8b8d-cc4c4e39b8fa" config-ref="Redis_Redis" key="#[vars.dedupKey]" target="existingDedupValue"/>
+		<logger level="INFO" doc:name="Logger" doc:id="778f0bd6-b8b6-437d-97fe-fef42207b4e8" message="DEDUP CHECK | dedupKey=#[vars.dedupKey] | existingDedupValue=#[vars.existingDedupValue]"/>
+		<logger level="INFO" doc:name="Logger" doc:id="d9a39690-cefb-4507-8fcb-303b1ed8a4c8" message='#[output text/plain ---&#10;"EventKey = "&#10;++ (vars.eventKey as String)&#10;++ " | DedupKey = "&#10;++ (vars.dedupKey as String)]' />
+		<set-variable value="#[payload.eventUuid]" doc:name="Set Variable" doc:id="1a4d3f01-a5fb-4231-9e1b-9a0aca43dbe7" variableName="eventUuid"/>
+		<set-variable value='#["cdc.dedup."&#10;    ++ (payload.entityName as String)&#10;    ++ "."&#10;    ++ (payload.recordId as String)&#10;    ++ "-"&#10;    ++ (payload.replayId as String)]' doc:name="Set Variable" doc:id="924cb127-4872-4205-a119-a85ea2456713" variableName="redisKey"/>
+		<redis:get doc:name="Get" doc:id="491f1316-0dfa-4291-8280-5d5d56fbeb93" config-ref="Redis_Redis" key="#[vars.redisKey]" target="previousDedupValue"/>
+		<choice doc:name="Choice" doc:id="7896efc6-1d02-4a1f-8019-f21db6db5526" >
+			<when expression="vars.previousDedupValue == null">
+				<set-variable value='#["cdc.watermark.ChangeEvents"]' doc:name="Set Variable" doc:id="2f1de091-5844-46b0-b6a7-9907f8d1b2e5" variableName="watermarkKey" />
+				<logger level="INFO" doc:name="Logger" doc:id="0f64cef5-dabb-43e0-91ab-b3da971d4c79" message='#[output text/plain ---&#10;"Watermark Key = "&#10;++ (vars.watermarkKey as String)&#10;++ " | Current ReplayId = "&#10;++ ((payload.replayId default "null") as String)]' />
+				<set-variable value='#[payload.entityName default "unknown"]' doc:name="Set Variable" doc:id="19c59289-7fc9-4562-a628-a5a6f81b0956" variableName="currentEntityName" />
+				<set-variable value="#[(payload.replayId as Number)]" doc:name="Set Variable" doc:id="df96fcc1-f083-4fbb-bc69-dbb828e77e15" variableName="currentReplayId" />
+				<set-variable value='#[payload.recordId default "unknown"]' doc:name="Set Variable" doc:id="2e2bf19d-52aa-43db-a86c-8f1cd2df6403" variableName="currentRecordId" />
+				<redis:get doc:name="Get" doc:id="95a48d79-1688-4081-a5c9-9d3225c40dea" config-ref="Redis_Redis" key="#[vars.watermarkKey]" target="previousWatermark" />
+				<logger level="INFO" doc:name="Logger" doc:id="55be4cb9-9811-475f-8f9b-ef360e5a7a11" message='#[output text/plain ---&#10;"Watermark Key = "&#10;++ (vars.watermarkKey default "null")&#10;++ " | Entity = "&#10;++ (vars.currentEntityName default "null")&#10;++ " | Previous Watermark = "&#10;++ ((vars.previousWatermark default "null") as String)&#10;++ " | Current ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+				<choice doc:name="Choice" doc:id="200dabe3-598b-4034-a687-f23161d8cdb4">
+			<when expression="#[vars.previousWatermark == null]">
+				<logger level="INFO" doc:name="Logger" doc:id="12a20587-0329-4da8-b513-f894818e08e4" message='#[output text/plain ---&#10;"FIRST EVENT | Entity = "&#10;++ (vars.currentEntityName default "unknown")&#10;++ " | ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+				<set-variable value="#[payload.replayId as Number]" doc:name="Set Variable" doc:id="16564964-289f-400f-8e94-a2c63b85568f" variableName="currentReplayId" />
+				<redis:set doc:name="Set" doc:id="f628206b-1c59-48f7-a7e9-0581d93cb1b8" config-ref="Redis_Redis" key="#[vars.watermarkKey]" target="watermarkSetResult">
+					<redis:value><![CDATA[#[payload.replayId as String]]]></redis:value>
+				</redis:set>
+				<logger level="INFO" doc:name="Logger" doc:id="efb81825-0ce4-4df9-9956-f668c035e0b6" message='#[output text/plain ---&#10;"WATERMARK INITIALIZED | Key = "&#10;++ (vars.watermarkKey default "null")&#10;++ " | ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+			</when>
+			<when expression="vars.currentReplayId == ((vars.previousWatermark as Number) + 1)">
+				<logger level="INFO" doc:name="Logger" doc:id="43fdb06c-d321-477b-b77c-72e268e64182" message='#[output text/plain ---&#10;"NORMAL REPLAY | Entity = "&#10;++ (vars.currentEntityName default "unknown")&#10;++ " | Current = "&#10;++ ((vars.currentReplayId default "null") as String)&#10;++ " | Previous = "&#10;++ ((vars.previousWatermark default "null") as String)&#10;++ " | Difference = 1"]' />
+				<redis:set doc:name="Set" doc:id="a154b376-adad-4281-8d4f-5a0065699467" config-ref="Redis_Redis" key="#[vars.watermarkKey]" target="watermarkSetResult">
+							<redis:value><![CDATA[#[vars.currentReplayId as String]]]></redis:value>
+						</redis:set>
+				<logger level="INFO" doc:name="Logger" doc:id="30a87c91-7267-43a5-a4cb-7a58734f76f3" message='#[output text/plain ---&#10;"WATERMARK UPDATED | Key = "&#10;++ (vars.watermarkKey default "null")&#10;++ " | ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+			</when>
+			<when expression="vars.currentReplayId &gt; ((vars.previousWatermark as Number) + 1)">
+				<logger level="INFO" doc:name="Logger" doc:id="82d38579-1c0c-4137-845d-6cffc320d232" message='#[output text/plain ---&#10;"REPLAY GAP DETECTED | Entity = "&#10;++ (vars.currentEntityName default "unknown")&#10;++ " | Current = "&#10;++ ((vars.currentReplayId default "null") as String)&#10;++ " | Previous = "&#10;++ ((vars.previousWatermark default "null") as String)&#10;++ " | Difference = "&#10;++ ((vars.currentReplayId - (vars.previousWatermark as Number)) as String)]' />
+				<logger level="INFO" doc:name="Logger" doc:id="81306021-e095-43e2-a6b1-d9d00243e02c" message='#[output text/plain ---&#10;"NOTIFY-ONLY MODE | Continuing event processing despite replay gap | Entity = "&#10;++ (vars.currentEntityName default "unknown")&#10;++ " | ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+				<redis:set doc:name="Set1" doc:id="6aba4ccb-cca3-4251-a6d1-e9b77b4167f0" config-ref="Redis_Redis" key="#[vars.watermarkKey]" target="watermarkSetResult">
+					<redis:value><![CDATA[#[vars.currentReplayId as String]]]></redis:value>
+				</redis:set>
+				<logger level="INFO" doc:name="Logger" doc:id="8487ae21-3206-450e-9825-7dcadd34ce8a" message='#[output text/plain ---&#10;"WATERMARK UPDATED AFTER GAP | Key = "&#10;++ (vars.watermarkKey default "null")&#10;++ " | ReplayId = "&#10;++ ((vars.currentReplayId default "null") as String)]' />
+			</when>
+					<otherwise>
+				<logger level="INFO" doc:name="Logger" doc:id="f48f5d79-6db6-4398-80c6-92e9a2c9876a" message='#[output text/plain ---&#10;"DUPLICATE / OUT-OF-ORDER | Entity = "&#10;++ (vars.currentEntityName default "unknown")&#10;++ " | Current = "&#10;++ ((vars.currentReplayId default "null") as String)&#10;++ " | Previous = "&#10;++ ((vars.previousWatermark default "null") as String)]' />
+			</otherwise>
+		</choice>
+				<redis:set doc:name="Set" doc:id="eda5905c-bb92-4fef-8d75-0a9ae94e79b3" key="#[vars.redisKey]" config-ref="Redis_Redis" ifNotExists="true">
+			<redis:value><![CDATA[#[write(payload, "application/json")]]]></redis:value>
+		</redis:set>
+				<logger level="INFO" doc:name="Logger" doc:id="b281cfe5-3ecf-4023-bc34-ac0b979c6c4d" message='#[output text/plain ---&#10;"Redis SET completed. Key = "&#10;++ (vars.redisKey as String)&#10;++ ", EventUuid = "&#10;++ (vars.eventUuid as String)&#10;++ ", Result = "&#10;++ (payload as String)]' />
+			</when>
+			<otherwise >
+				<logger level="INFO" doc:name="Logger" doc:id="5af0ba38-2c36-4c1e-9097-d5c10152f4f3" message="DUPLICATE EVENT SKIPPED | DedupKey = #[vars.dedupKey]"/>
+			</otherwise>
+		</choice>
+	</flow>
+	<flow name="apexCalloutFlow" doc:id="c340e5c6-7b40-421f-be67-ce0ca95eb1fc" >
+		<http:listener doc:name="Listener" doc:id="8f90994f-67df-4014-9c90-69694b598ac4" config-ref="HTTP_Listener_config" path="/event"/>
+		<logger level="INFO" doc:name="Logger" doc:id="c3cbc8d6-fc70-4c53-96d0-a642dbbe4b80" message="#[payload]"/>
+	</flow>
+	<flow name="eventIngestionFlow" doc:id="56618426-5bd8-4b41-beba-54ccf022e108" >
+		<http:listener doc:name="Listener" doc:id="f2179a7e-99fd-43d1-9222-3f991a207afd" config-ref="HTTP_Listener_config" path="/events"/>
+		<logger level="INFO" doc:name="Logger" doc:id="a1cf4e12-b393-4648-8a39-eb6374289496" message="EVENT INGESTION | Attributes = #[attributes]"/>
+		<logger level="INFO" doc:name="Logger" doc:id="b8e689ba-c3b4-4360-ba83-0bd434ba957a" message="EVENT INGESTION RECEIVED | Payload = #[payload]"/>
+		<ee:transform doc:name="Transform Message" doc:id="4ea66f3b-5a0f-4114-9519-8dfb7c0662e5" >
+			<ee:message >
+				<ee:set-payload ><![CDATA[{
+  "status": "accepted",
+  "message": "CDC event received"
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+</mule>

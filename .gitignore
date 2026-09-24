@@ -1,0 +1,29 @@
+# Java and Mule build artifacts
+*.class
+*.jar
+*.war
+*.ear
+target/
+.mule/
+
+# Eclipse and local workspace files
+.metadata
+bin/
+tmp/
+*.tmp
+*.bak
+*.swp
+*~.nib
+local.properties
+.settings/
+.loadpath
+.project
+.classpath
+.externalToolBuilders/
+*.launch
+.cproject
+.buildpath
+
+# Local files
+.DS_Store
+velocity.log
