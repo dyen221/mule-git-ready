@@ -175,7 +175,7 @@ do {
 				<redis:set doc:name="Set" doc:id="eda5905c-bb92-4fef-8d75-0a9ae94e79b3" key="#[vars.redisKey]" config-ref="Redis_Redis" ifNotExists="true">
 			<redis:value><![CDATA[#[write(payload, "application/json")]]]></redis:value>
 		</redis:set>
-				<logger level="INFO" doc:name="Logger" doc:id="b281cfe5-3ecf-4023-bc34-ac0b979c6c4d" message='#[output text/plain ---&#10;"Redis SET completed. Key = "&#10;++ (vars.redisKey as String)&#10;++ ", EventUuid = "&#10;++ (vars.eventUuid as String)&#10;++ ", Result = "&#10;++ (payload as String)]' />
+				<logger level="INFO" doc:name="Logger" doc:id="b281cfe5-3ecf-4023-bc34-ac0b979c6c4d" message='#[output text/plain ---&#10;"Redis SET completed. Key = "&#10;++ (vars.redisKey as String)&#10;++ ", ProcessingUuid = "&#10;++ (vars.processingUuid as String)&#10;++ ", Result = "&#10;++ (payload as String)]' />
 			</when>
 			<otherwise >
 				<logger level="INFO" doc:name="Logger" doc:id="5af0ba38-2c36-4c1e-9097-d5c10152f4f3" message="DUPLICATE EVENT SKIPPED | DedupKey = #[vars.dedupKey]"/>
