@@ -1,0 +1,10 @@
+# Copy this file to config.properties and replace the Salesforce values.
+salesforce.clientId=REPLACE_WITH_SALESFORCE_CLIENT_ID
+salesforce.clientSecret=REPLACE_WITH_SALESFORCE_CLIENT_SECRET
+salesforce.tokenUrl=https://login.salesforce.com/services/oauth2/token
+
+# Local Redis defaults. Change these values for a remote Redis instance.
+redis.host=localhost
+redis.port=6379
+redis.username=
+redis.password=

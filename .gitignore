@@ -5,6 +5,7 @@
 *.ear
 target/
 .mule/
+src/main/resources/config.properties
 
 # Eclipse and local workspace files
 .metadata
