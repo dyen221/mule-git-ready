@@ -94,7 +94,7 @@ do {
     {
         // Mule-generated processing UUID.
         // This is NOT the Salesforce CDC EventUuid.
-        processingUuid: uuid(),
+        "processingUuid": uuid(),
 
         // Current deduplication identity.
         eventKey:
